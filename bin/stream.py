@@ -29,6 +29,31 @@ from pyatv.scripts import (
 
 _LOGGER = logging.getLogger(__name__)
 
+NORMALIZED_AUDIO_EXTENSIONS = {'.aif', '.aiff'}
+
+
+async def open_normalized_audio(source: str):
+    """Return an ffmpeg PCM-WAV pipe suitable for predictable RAOP playback."""
+    process = await asp.create_subprocess_exec(
+        'ffmpeg',
+        '-hide_banner', '-loglevel', 'error',
+        '-rtbufsize', '25M',
+        '-i', source,
+        '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
+        '-f', 'wav', 'pipe:1',
+        stdin=None, stdout=asp.PIPE, stderr=None,
+    )
+    return process, StreamReaderListener(process.stdout, lambda: None)
+
+
+async def close_normalized_audio(process) -> None:
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    await process.wait()
+
 
 def is_valid_url(url) -> bool:
     try:
@@ -244,14 +269,8 @@ class AtvStreamer:
                 f"* Could not connect to ATV id: {self.atv.atv_identifier}")
             return
 
-        ffmpeg_proc = await asp.create_subprocess_exec(
-            'ffmpeg',
-            '-rtbufsize', '25M',
-            '-i', stream_config.stream_url,
-            '-f', 'mp3',
-            '-',
-            stdin=None, stdout=asp.PIPE, stderr=None,
-        )
+        ffmpeg_proc, normalized_stream = await open_normalized_audio(stream_config.stream_url)
+        normalized_stream.heartbeat = self.stream_heartbeat
 
         try:
             self.logger.info(
@@ -263,7 +282,7 @@ class AtvStreamer:
             await asyncio.gather(
                 self.stream_monitor(int(stream_config.stream_timeout)),
                 self.refresh_metadata(stream_config),
-                self.internal_stream_url(metadata, StreamReaderListener(ffmpeg_proc.stdout, self.stream_heartbeat), 0))
+                self.internal_stream_url(metadata, normalized_stream, 0))
             await asyncio.sleep(1)
         except Exception as ex:
             self.logger.error(
@@ -271,6 +290,7 @@ class AtvStreamer:
             traceback.print_exc()
         finally:
             self.streaming_finished = True
+            await close_normalized_audio(ffmpeg_proc)
             self.atv.close()
 
     async def prepare_metadata(self, stream_config: StreamConfig) -> MediaMetadata:
@@ -387,7 +407,14 @@ class AtvStreamer:
 
             for song_path in song_files:
                 self.logger.info(f"Playing {song_path}")
-                await self.atv.stream_file(song_path, metadata)
+                if os.path.splitext(song_path)[1].lower() in NORMALIZED_AUDIO_EXTENSIONS:
+                    ffmpeg_proc, normalized_stream = await open_normalized_audio(song_path)
+                    try:
+                        await self.atv.stream_buffer(normalized_stream, metadata)
+                    finally:
+                        await close_normalized_audio(ffmpeg_proc)
+                else:
+                    await self.atv.stream_file(song_path, metadata)
                 await asyncio.sleep(1)
 
         except Exception as ex:

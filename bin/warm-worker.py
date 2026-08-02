@@ -24,6 +24,7 @@ matching the existing ``stream.py`` semantics.
 """
 import argparse
 import asyncio
+import asyncio.subprocess as asp
 import json
 import logging
 import os
@@ -52,6 +53,28 @@ except ImportError:
 
 
 _LOGGER = logging.getLogger("warm-worker")
+_NORMALIZED_AUDIO_EXTENSIONS = {".aif", ".aiff"}
+
+
+async def _open_normalized_audio(source: str):
+    process = await asp.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
+        "-i", source,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+        "-f", "wav", "pipe:1",
+        stdin=None, stdout=asp.PIPE, stderr=None,
+    )
+    return process, process.stdout
+
+
+async def _close_normalized_audio(process) -> None:
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    await process.wait()
 
 
 def _out(obj) -> None:
@@ -188,7 +211,14 @@ class WarmConnection:
                     metadata = MediaMetadata(title=title, album=title, artist=None, artwork=None)
                     for song in songs:
                         _LOGGER.info("streaming %s (attempt %d)", song, attempt)
-                        await atv.stream.stream_file(song, metadata)
+                        if os.path.splitext(song)[1].lower() in _NORMALIZED_AUDIO_EXTENSIONS:
+                            ffmpeg_proc, normalized_stream = await _open_normalized_audio(song)
+                            try:
+                                await atv.stream.stream_file(normalized_stream, metadata)
+                            finally:
+                                await _close_normalized_audio(ffmpeg_proc)
+                        else:
+                            await atv.stream.stream_file(song, metadata)
                     _LOGGER.info("finished streaming %d file(s)", len(songs))
                     return
                 except Exception as ex:  # noqa: BLE001

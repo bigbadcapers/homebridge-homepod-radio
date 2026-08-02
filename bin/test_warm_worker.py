@@ -12,6 +12,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 import wave
 
 # ``warm-worker.py`` is not an importable module name (hyphen), so load it by
@@ -92,6 +93,37 @@ class ExpandPlaylistTests(unittest.TestCase):
                 songs,
                 [os.path.join(folder, "song-one.mp3"), os.path.join(folder, "song-two.mp3")],
             )
+
+
+class AudioNormalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_aiff_is_normalized_to_raop_safe_pcm_wav(self):
+        process = unittest.mock.Mock()
+        process.stdout = object()
+        with patch.object(
+            warm_worker.asp,
+            "create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as create:
+            actual_process, stream = await warm_worker._open_normalized_audio("clip.aiff")
+
+        self.assertIs(actual_process, process)
+        self.assertIs(stream, process.stdout)
+        args = create.await_args.args
+        self.assertEqual(args[0], "ffmpeg")
+        self.assertIn(("-acodec", "pcm_s16le"), list(zip(args, args[1:])))
+        self.assertIn(("-ar", "44100"), list(zip(args, args[1:])))
+        self.assertIn(("-ac", "2"), list(zip(args, args[1:])))
+        self.assertEqual(args[-3:], ("-f", "wav", "pipe:1"))
+
+    async def test_normalizer_is_terminated_and_reaped(self):
+        process = unittest.mock.Mock()
+        process.returncode = None
+        process.wait = AsyncMock()
+
+        await warm_worker._close_normalized_audio(process)
+
+        process.terminate.assert_called_once_with()
+        process.wait.assert_awaited_once_with()
 
 
 if __name__ == "__main__":
